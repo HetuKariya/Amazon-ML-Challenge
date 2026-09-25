@@ -68,6 +68,20 @@ def address_tokens(addr) -> frozenset:
     return frozenset(normalize_address(addr).split())
 
 
+ADDRESS_STOPWORDS = frozenset(ADDRESS_ABBREV.values()) | frozenset({"near", "no", "of", "the", "and"})
+
+
+def address_signal_tokens(addr) -> frozenset:
+    """Address tokens with generic, near-universal words removed --
+    street-type abbreviations (st, ave, rd, ...) and common landmark-
+    reference fillers ("Near ...") appear in nearly every address
+    regardless of which business it belongs to, so leaving them in
+    inflates Jaccard similarity between addresses that aren't actually
+    related. Street numbers and place names are kept -- those ARE
+    discriminative."""
+    return frozenset(t for t in address_tokens(addr) if t not in ADDRESS_STOPWORDS)
+
+
 def jaccard(a: frozenset, b: frozenset) -> float:
     if not a and not b:
         return 1.0

@@ -46,7 +46,7 @@ import sys
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from normalize import normalize_name, name_tokens, address_tokens, jaccard  # noqa: E402
+from normalize import normalize_name, name_tokens, address_signal_tokens, jaccard  # noqa: E402
 from scoring import f0_5_macro, deterministic_split  # noqa: E402
 
 MIN_KEY_LEN = 2  # normalized names shorter than this are excluded from blocking
@@ -207,14 +207,20 @@ def build_candidate_pairs(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame) 
 
 
 def add_similarity_features(pairs: pd.DataFrame) -> pd.DataFrame:
-    """Adds 'addr_jaccard', 'name_jaccard', and 'combined_score' (their
-    average) columns.
+    """Adds 'addr_jaccard' and 'name_jaccard' columns (kept as separate
+    signals -- see tune_threshold for why they're NOT collapsed into one
+    combined scalar).
 
     Normalizes each UNIQUE name/address string exactly once and looks
     the result up for every row, instead of re-running the regex-based
     tokenizer per pair -- a single generic-name block repeats the same
     strings across thousands of pair rows, so naive per-row tokenization
-    redoes the same regex work thousands of times over."""
+    redoes the same regex work thousands of times over.
+
+    Address similarity uses address_signal_tokens (generic words like
+    'st'/'ave'/'suite' stripped out) rather than raw address_tokens --
+    otherwise two unrelated addresses that happen to both contain "St"
+    and "Suite" register as partially similar for no meaningful reason."""
     pairs = pairs.copy()
     n_pairs = len(pairs)
 
@@ -223,7 +229,7 @@ def add_similarity_features(pairs: pd.DataFrame) -> pd.DataFrame:
     )
     print(f"  tokenizing {len(unique_addrs):,} unique addresses "
           f"(from {n_pairs:,} candidate pairs)...")
-    addr_tok_map = {a: address_tokens(a) for a in unique_addrs}
+    addr_tok_map = {a: address_signal_tokens(a) for a in unique_addrs}
     s1_atok = pairs["s1_address"].map(addr_tok_map)
     cand_atok = pairs["cand_address"].map(addr_tok_map)
 
@@ -238,14 +244,6 @@ def add_similarity_features(pairs: pd.DataFrame) -> pd.DataFrame:
     print("  scoring pairs...")
     pairs["addr_jaccard"] = [jaccard(a, b) for a, b in zip(s1_atok, cand_atok)]
     pairs["name_jaccard"] = [jaccard(a, b) for a, b in zip(s1_ntok, cand_ntok)]
-    # min(), not average: the loose blocking key GUARANTEES high name
-    # similarity for every pair it produces (that's what it blocked on),
-    # so an average lets that alone drag a pair over the threshold even
-    # when the address is completely unrelated -- exactly the kind of
-    # false merge F_0.5 punishes hardest. Requiring both signals to be
-    # simultaneously high is much harder for a same-name-different-
-    # business collision to fake.
-    pairs["combined_score"] = pairs[["addr_jaccard", "name_jaccard"]].min(axis=1)
     return pairs
 
 
@@ -267,24 +265,37 @@ def build_candidates(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame) -> di
 
 
 def tune_threshold(pairs: pd.DataFrame, ground_truth: dict, all_s1_ids,
-                    thresholds=None):
-    """Grid-searches the combined_score (avg of name_jaccard and
-    addr_jaccard) threshold that maximizes local F_0.5 macro on the
-    given (validation) ground truth. Returns
-    (best_threshold, best_result_dict, full_grid_results)."""
-    if thresholds is None:
-        thresholds = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+                    name_thresholds=None, addr_thresholds=None):
+    """Grid-searches OVER BOTH name_jaccard and addr_jaccard thresholds
+    independently (not collapsed into one combined scalar) to maximize
+    local F_0.5 macro on the given (validation) ground truth.
+
+    Why two separate thresholds instead of one: name and address carry
+    different, non-interchangeable evidence. A single combined score
+    (whether average or min) forces a fixed tradeoff between them; a 2D
+    grid lets the data tell us, e.g., "require decent address overlap
+    regardless of name" if that turns out to separate true/false matches
+    better than any symmetric combination would.
+
+    Returns (best_name_threshold, best_addr_threshold, best_result_dict,
+    full_grid_results) where full_grid_results is a list of
+    ((name_t, addr_t), result_dict) sorted by f0_5_macro descending.
+    """
+    if name_thresholds is None:
+        name_thresholds = [0.0, 0.2, 0.4, 0.6, 0.8]
+    if addr_thresholds is None:
+        addr_thresholds = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
     pairs = add_similarity_features(pairs)
     grid = []
-    best = (None, None)
-    for t in thresholds:
-        kept = pairs[pairs["combined_score"] >= t]
-        preds = candidates_dict_from_pairs(kept, all_s1_ids)
-        result = f0_5_macro(preds, ground_truth)
-        grid.append((t, result))
-        if best[1] is None or result["f0_5_macro"] > best[1]["f0_5_macro"]:
-            best = (t, result)
-    return best[0], best[1], grid
+    for tn in name_thresholds:
+        for ta in addr_thresholds:
+            kept = pairs[(pairs["name_jaccard"] >= tn) & (pairs["addr_jaccard"] >= ta)]
+            preds = candidates_dict_from_pairs(kept, all_s1_ids)
+            result = f0_5_macro(preds, ground_truth)
+            grid.append(((tn, ta), result))
+    grid.sort(key=lambda x: x[1]["f0_5_macro"], reverse=True)
+    best_thresholds, best_result = grid[0]
+    return best_thresholds[0], best_thresholds[1], best_result, grid
 
 
 def _write_tsv(path: str, id_col: str, list_col: str, data: dict):
@@ -338,16 +349,16 @@ def run_cv(data_root: str, val_frac: float, seed: int, sample_s1: int = None):
     for k, v in unfiltered_result.items():
         print(f"  {k}: {v}")
 
-    print("\nTuning combined name+address similarity threshold on the validation fold...")
-    best_t, best_result, grid = tune_threshold(pairs, val_gt, all_val_ids)
-    print("\n=== THRESHOLD GRID ===")
-    for t, r in grid:
-        print(f"  threshold={t:.1f}  f0_5_macro={r['f0_5_macro']:.4f}  "
+    print("\nTuning name/address similarity thresholds (2D grid) on the validation fold...")
+    best_tn, best_ta, best_result, grid = tune_threshold(pairs, val_gt, all_val_ids)
+    print("\n=== TOP 15 THRESHOLD COMBINATIONS (by f0_5_macro) ===")
+    for (tn, ta), r in grid[:15]:
+        print(f"  name>={tn:.1f}  addr>={ta:.1f}  f0_5_macro={r['f0_5_macro']:.4f}  "
               f"singleton_acc={r['singleton_accuracy']:.4f}  "
               f"precision={r['mean_precision_nonsingleton']:.4f}  "
               f"recall={r['mean_recall_nonsingleton']:.4f}")
 
-    print(f"\n=== BEST: threshold={best_t} ===")
+    print(f"\n=== BEST: name_threshold={best_tn}  addr_threshold={best_ta} ===")
     for k, v in best_result.items():
         print(f"  {k}: {v}")
 
@@ -356,10 +367,10 @@ def run_cv(data_root: str, val_frac: float, seed: int, sample_s1: int = None):
           f"{len(candidates):,} ({n_with_candidates/len(candidates):.1%})")
     print(f"  (this is the RECALL CEILING -- no threshold can recover entities missing here;"
           f" that requires better blocking, not better filtering)")
-    return best_t, best_result
+    return best_tn, best_ta, best_result
 
 
-def run_submit(data_root: str, output_dir: str, threshold: float):
+def run_submit(data_root: str, output_dir: str, name_threshold: float, addr_threshold: float):
     test_dir = os.path.join(data_root, "test")
 
     print("Loading test files...")
@@ -375,9 +386,10 @@ def run_submit(data_root: str, output_dir: str, threshold: float):
     pairs = build_candidate_pairs(t1, t2, t3)
     candidates = candidates_dict_from_pairs(pairs, all_ids)  # unfiltered -> candidate_pairs.tsv
 
-    print(f"Applying tuned combined-score threshold ({threshold}) for final matches...")
+    print(f"Applying tuned thresholds (name>={name_threshold}, addr>={addr_threshold}) "
+          f"for final matches...")
     pairs = add_similarity_features(pairs)
-    kept = pairs[pairs["combined_score"] >= threshold]
+    kept = pairs[(pairs["name_jaccard"] >= name_threshold) & (pairs["addr_jaccard"] >= addr_threshold)]
     predictions = candidates_dict_from_pairs(kept, all_ids)  # filtered -> matching_results.tsv
 
     matching_path = os.path.join(output_dir, "matching_results.tsv")
@@ -400,8 +412,11 @@ def main():
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--val-frac", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--threshold", type=float, default=None,
-                         help="combined_score threshold for --mode submit; "
+    parser.add_argument("--name-threshold", type=float, default=None,
+                         help="name_jaccard threshold for --mode submit; "
+                              "get this from the 'BEST' line printed by --mode cv")
+    parser.add_argument("--addr-threshold", type=float, default=None,
+                         help="addr_jaccard threshold for --mode submit; "
                               "get this from the 'BEST' line printed by --mode cv")
     parser.add_argument("--sample-s1", type=int, default=None,
                          help="(cv mode only) use only this many S1 entities from the "
@@ -412,9 +427,10 @@ def main():
     if args.mode == "cv":
         run_cv(args.data_root, args.val_frac, args.seed, sample_s1=args.sample_s1)
     else:
-        if args.threshold is None:
-            parser.error("--mode submit requires --threshold <value from cv mode's BEST result>")
-        run_submit(args.data_root, args.output_dir, args.threshold)
+        if args.name_threshold is None or args.addr_threshold is None:
+            parser.error("--mode submit requires --name-threshold and --addr-threshold "
+                         "(from the 'BEST' line printed by --mode cv)")
+        run_submit(args.data_root, args.output_dir, args.name_threshold, args.addr_threshold)
 
 
 if __name__ == "__main__":
