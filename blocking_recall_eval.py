@@ -247,7 +247,10 @@ def evaluate_union(s1_info, match_rows, key_names):
 
         for key_name in key_names:
             s1_key = str(s1[key_name]) + "||" + str(s1["country"])
-            m_key = str(row[key_name]) + "||" + str(row["country"])
+            # row is a namedtuple from itertuples() — must use getattr(), not
+            # row[key_name], which only accepts integer indices on namedtuples.
+            # evaluate_key() above already uses getattr() correctly.
+            m_key = str(getattr(row, key_name)) + "||" + str(row.country)
 
             if s1_key and s1_key == m_key:
                 recovered = True

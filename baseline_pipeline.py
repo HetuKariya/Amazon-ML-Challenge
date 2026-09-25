@@ -342,8 +342,12 @@ def run_cv(data_root: str, val_frac: float, seed: int, sample_s1: int = None):
     best_t, best_result, grid = tune_threshold(pairs, val_gt, all_val_ids)
     print("\n=== THRESHOLD GRID ===")
     for t, r in grid:
+        # singleton_fp_rate: fraction of true no-match entities wrongly given a prediction.
+        # F0.5 weights precision 2x, so this is the dominant calibration lever --
+        # watch it alongside nonsingleton_f0_5 (matching quality on the harder entities).
         print(f"  threshold={t:.1f}  f0_5_macro={r['f0_5_macro']:.4f}  "
-              f"singleton_acc={r['singleton_accuracy']:.4f}  "
+              f"singleton_fp_rate={r['singleton_fp_rate']:.4f}  "
+              f"nonsingleton_f0_5={r['nonsingleton_f0_5']:.4f}  "
               f"precision={r['mean_precision_nonsingleton']:.4f}  "
               f"recall={r['mean_recall_nonsingleton']:.4f}")
 
