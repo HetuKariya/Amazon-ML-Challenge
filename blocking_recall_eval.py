@@ -45,12 +45,17 @@ def load_source(path):
 
 
 def load_ground_truth(path):
+    # Category 1: switched from itertuples() to direct column access.
+    # itertuples() builds attribute names from column headers and silently
+    # renames any column whose header isn't a valid Python identifier to '_1',
+    # '_2', etc. -- causing an AttributeError on row.matched_entity_ids even
+    # though df["matched_entity_ids"] works fine. baseline_pipeline.py already
+    # documents this exact failure mode and avoids it the same way.
     df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    df.columns = [str(c).strip() for c in df.columns]  # strip BOM/stray whitespace
     gt = {}
-    for row in df.itertuples(index=False):
-        gt[row.source1_entity_id] = [
-            x for x in row.matched_entity_ids.split(",") if x
-        ]
+    for s1_id, matched in zip(df["source1_entity_id"], df["matched_entity_ids"]):
+        gt[s1_id] = [x for x in matched.split(",") if x]
     return gt
 
 
@@ -58,20 +63,34 @@ def make_name_features(series):
     """
     Compute several country-agnostic name blocking signatures.
     normalize_name() itself remains the canonical implementation.
-    """
-    values = series.astype(str).tolist()
 
-    name_norm = []
+    Category 3 note: MIN_TOKEN_LEN = 3 filters sub-3-char tokens when
+    computing first_token/last_token here. The pipeline's add_blocking_key()
+    uses a different criterion (MIN_KEY_LEN = 3 on the full normalized name,
+    not per-token). This means eval recall numbers for 'first_token' reflect
+    a slightly stricter definition than what the pipeline indexes -- actual
+    pipeline recall may be marginally higher for names whose first meaningful
+    token is 2 chars (e.g. "AB Solutions" -> first_token="ab" in pipeline
+    but "solutions" here). Keep MIN_TOKEN_LEN=3 as a conservative floor;
+    do not change it to match the pipeline without re-running the eval.
+    """
+    # Category 2: name_norm uses vectorized Series.map instead of a Python
+    # loop -- normalize_name() uses compiled regexes so the per-call cost is
+    # low, but avoiding the list accumulation overhead matters at 100K+ rows.
+    # sorted_name and boundary retain the loop because their conditional logic
+    # (sort+dedup, compact[:4]+compact[-4:]) doesn't vectorize cleanly without
+    # .apply(), which is equally slow.
+    norm_series = series.astype(str).map(normalize_name)
+    values = norm_series.tolist()
+
+    name_norm = norm_series.tolist()
     sorted_name = []
     first_token = []
     last_token = []
     first_last = []
     boundary = []
 
-    for raw in values:
-        n = normalize_name(raw)
-        name_norm.append(n)
-
+    for n in values:
         toks = [t for t in n.split() if len(t) >= MIN_TOKEN_LEN]
 
         if toks:
@@ -175,119 +194,114 @@ def evaluate_key(s1_info, match_rows, gt, key_name):
       - pair/global recall
       - mean per-entity recall
       - entity coverage (at least one true match recoverable)
+
+    Category 2: replaced itertuples() row loop with a vectorized merge.
+    The original loop did 382K Python iterations per key (× 6 keys = 2.3M
+    total) and was the dominant runtime cost (~3+ minutes). The merge is
+    O(n) and runs in pandas C code.
     """
-    s1_by_id = s1_info.set_index("entity_id")
+    feature_cols = ["entity_id", "country", key_name]
+    s1_keys = s1_info[feature_cols].copy()
+    s1_keys["s1_composite"] = s1_keys[key_name].astype(str) + "||" + s1_keys["country"].astype(str)
 
-    per_entity_recalled = {}
-    total_true = 0
-    total_recovered = 0
+    # Category 1 fix: the original guard was `s1_key != ""`, but the
+    # composite key is never literally "" -- an empty feature produces
+    # "||US" which would spuriously match any other blank-named entity in
+    # that country. Check the feature part alone is non-empty.
+    s1_keys["s1_valid"] = s1_keys[key_name].astype(str).str.strip() != ""
 
-    for row in match_rows.itertuples(index=False):
-        eid = row.source1_entity_id
-        matched_id = row.matched_entity_id
+    match_cols = ["source1_entity_id", "matched_entity_id", "country", key_name]
+    mr = match_rows[match_cols].copy()
+    mr["m_composite"] = mr[key_name].astype(str) + "||" + mr["country"].astype(str)
 
-        s1 = s1_by_id.loc[eid]
+    merged = mr.merge(
+        s1_keys[["entity_id", "s1_composite", "s1_valid"]],
+        left_on="source1_entity_id",
+        right_on="entity_id",
+        how="left",
+    )
 
-        s1_key = str(s1[key_name]) + "||" + str(s1["country"])
-        m_key = str(getattr(row, key_name)) + "||" + str(row.country)
+    merged["hit"] = (
+        merged["s1_valid"].fillna(False)
+        & (merged["s1_composite"] == merged["m_composite"])
+    )
 
-        total_true += 1
-        hit = s1_key != "" and s1_key == m_key
+    total_true = len(merged)
+    total_recovered = int(merged["hit"].sum())
 
-        if hit:
-            total_recovered += 1
-
-        rec = per_entity_recalled.get(eid)
-        if rec is None:
-            per_entity_recalled[eid] = [0, 0]
-
-        per_entity_recalled[eid][1] += 1
-        if hit:
-            per_entity_recalled[eid][0] += 1
-
-    recalls = []
-    entity_with_any = 0
-
-    for eid, (covered, total) in per_entity_recalled.items():
-        recalls.append(covered / total if total else 0.0)
-        if covered > 0:
-            entity_with_any += 1
+    per_entity = merged.groupby("source1_entity_id").agg(
+        covered=("hit", "sum"),
+        total=("hit", "count"),
+    )
+    per_entity["recall"] = per_entity["covered"] / per_entity["total"]
+    entity_with_any = int((per_entity["covered"] > 0).sum())
+    n_entities = len(per_entity)
 
     return {
-        "mean_entity_recall": (
-            sum(recalls) / len(recalls) if recalls else 0.0
-        ),
-        "global_pair_recall": (
-            total_recovered / total_true if total_true else 0.0
-        ),
+        "mean_entity_recall": float(per_entity["recall"].mean()) if n_entities else 0.0,
+        "global_pair_recall": total_recovered / total_true if total_true else 0.0,
         "entities_with_any_true_match_recovered": entity_with_any,
-        "n_non_singleton_entities": len(per_entity_recalled),
-        "entity_coverage": (
-            entity_with_any / len(per_entity_recalled)
-            if per_entity_recalled
-            else 0.0
-        ),
+        "n_non_singleton_entities": n_entities,
+        "entity_coverage": entity_with_any / n_entities if n_entities else 0.0,
         "total_true_pairs": total_true,
         "recovered_true_pairs": total_recovered,
     }
 
 
 def evaluate_union(s1_info, match_rows, key_names):
-    s1_by_id = s1_info.set_index("entity_id")
+    """
+    Category 2: replaced itertuples() loop with a vectorized approach.
+    For each key, compute a composite key for S1 and the matched row, then
+    mark a pair as recovered if ANY key matches. Uses pandas merge per key
+    then takes the union via boolean OR -- same semantics as the original
+    loop but without Python-level row iteration.
+    """
+    # Build S1 composite keys for all requested key_names at once.
+    s1_sub = s1_info[["entity_id", "country"] + list(key_names)].copy()
+    for kn in key_names:
+        col = f"s1_{kn}_composite"
+        s1_sub[col] = s1_sub[kn].astype(str) + "||" + s1_sub["country"].astype(str)
+        # Category 1: guard against empty feature part (see evaluate_key fix).
+        s1_sub[f"s1_{kn}_valid"] = s1_sub[kn].astype(str).str.strip() != ""
 
-    per_entity = {}
-    total_true = 0
-    total_recovered = 0
+    mr = match_rows[["source1_entity_id", "matched_entity_id", "country"] + list(key_names)].copy()
+    for kn in key_names:
+        mr[f"m_{kn}_composite"] = mr[kn].astype(str) + "||" + mr["country"].astype(str)
 
-    for row in match_rows.itertuples(index=False):
-        eid = row.source1_entity_id
-        s1 = s1_by_id.loc[eid]
+    merged = mr.merge(
+        s1_sub[["entity_id"] + [f"s1_{kn}_composite" for kn in key_names]
+                              + [f"s1_{kn}_valid" for kn in key_names]],
+        left_on="source1_entity_id",
+        right_on="entity_id",
+        how="left",
+    )
 
-        recovered = False
+    # A pair is recovered if ANY key matches (union semantics).
+    recovered = pd.Series(False, index=merged.index)
+    for kn in key_names:
+        recovered |= (
+            merged[f"s1_{kn}_valid"].fillna(False)
+            & (merged[f"s1_{kn}_composite"] == merged[f"m_{kn}_composite"])
+        )
+    merged["hit"] = recovered
 
-        for key_name in key_names:
-            s1_key = str(s1[key_name]) + "||" + str(s1["country"])
-            # row is a namedtuple from itertuples() — must use getattr(), not
-            # row[key_name], which only accepts integer indices on namedtuples.
-            # evaluate_key() above already uses getattr() correctly.
-            m_key = str(getattr(row, key_name)) + "||" + str(row.country)
+    total_true = len(merged)
+    total_recovered = int(merged["hit"].sum())
 
-            if s1_key and s1_key == m_key:
-                recovered = True
-                break
-
-        total_true += 1
-
-        if eid not in per_entity:
-            per_entity[eid] = [0, 0]
-
-        per_entity[eid][1] += 1
-
-        if recovered:
-            total_recovered += 1
-            per_entity[eid][0] += 1
-
-    recalls = []
-    covered_entities = 0
-
-    for covered, total in per_entity.values():
-        recalls.append(covered / total if total else 0.0)
-        if covered:
-            covered_entities += 1
+    per_entity = merged.groupby("source1_entity_id").agg(
+        covered=("hit", "sum"),
+        total=("hit", "count"),
+    )
+    per_entity["recall"] = per_entity["covered"] / per_entity["total"]
+    covered_entities = int((per_entity["covered"] > 0).sum())
+    n_entities = len(per_entity)
 
     return {
-        "mean_entity_recall": (
-            sum(recalls) / len(recalls) if recalls else 0.0
-        ),
-        "global_pair_recall": (
-            total_recovered / total_true if total_true else 0.0
-        ),
-        "entity_coverage": (
-            covered_entities / len(per_entity)
-            if per_entity else 0.0
-        ),
+        "mean_entity_recall": float(per_entity["recall"].mean()) if n_entities else 0.0,
+        "global_pair_recall": total_recovered / total_true if total_true else 0.0,
+        "entity_coverage": covered_entities / n_entities if n_entities else 0.0,
         "covered_entities": covered_entities,
-        "n_non_singleton_entities": len(per_entity),
+        "n_non_singleton_entities": n_entities,
         "total_true_pairs": total_true,
         "recovered_true_pairs": total_recovered,
     }
@@ -361,20 +375,19 @@ def run(data_root, val_frac, seed):
     )
 
     def attach_pairs(pair_df, true_df):
+        feature_cols = [
+            "source1_entity_id",
+            "matched_entity_id",
+            "country",
+            "name_norm",
+            "sorted_name",
+            "first_token",
+            "last_token",
+            "first_last",
+            "boundary",
+        ]
         if pair_df.empty:
-            return pd.DataFrame(
-                columns=[
-                    "source1_entity_id",
-                    "matched_entity_id",
-                    "country",
-                    "name_norm",
-                    "sorted_name",
-                    "first_token",
-                    "last_token",
-                    "first_last",
-                    "boundary",
-                ]
-            )
+            return pd.DataFrame(columns=feature_cols)
 
         m = pair_df.merge(
             true_df,
@@ -387,20 +400,17 @@ def run(data_root, val_frac, seed):
 
         m = m.rename(columns={"country": "country"})
 
+        # Category 1: fill NaN feature columns that arise when a matched
+        # entity_id is absent from the source file (data gap). Without this,
+        # those rows produce "nan||nan" composite keys in evaluate_key/union
+        # which silently inflate miss counts rather than failing loudly.
+        for col in ["name_norm", "sorted_name", "first_token",
+                    "last_token", "first_last", "boundary", "country"]:
+            if col in m.columns:
+                m[col] = m[col].fillna("")
+
         # true_df feature columns are already named correctly.
-        return m[
-            [
-                "source1_entity_id",
-                "matched_entity_id",
-                "country",
-                "name_norm",
-                "sorted_name",
-                "first_token",
-                "last_token",
-                "first_last",
-                "boundary",
-            ]
-        ]
+        return m[feature_cols]
 
     s2_eval = attach_pairs(
         s2_match_pairs, prepare_match_info(s2_true)
@@ -445,6 +455,22 @@ def run(data_root, val_frac, seed):
         (
             "exact + sorted + first_last + boundary",
             ["name_norm", "sorted_name", "first_last", "boundary"],
+        ),
+        # Category 3: added first_token combinations. first_token is the
+        # strongest single key (76% recall, 95.6% entity coverage) and is
+        # now used by baseline_pipeline.py as block_key_first. Including it
+        # here shows the actual ceiling of the updated pipeline.
+        (
+            "first_token only",
+            ["first_token"],
+        ),
+        (
+            "exact + first_token",
+            ["name_norm", "first_token"],
+        ),
+        (
+            "exact + first_token + sorted + first_last",
+            ["name_norm", "first_token", "sorted_name", "first_last"],
         ),
         (
             "all name keys",
