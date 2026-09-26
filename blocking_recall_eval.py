@@ -10,7 +10,7 @@ This is deliberately different from blocking_v2.py:
 - It reads the ground-truth matched IDs.
 - It fetches only the S2/S3 rows that are actually true matches.
 - It computes blocking keys on S1 validation rows and true matched rows.
-- It reports how many true matches each blocking key would recover.
+- It reports how many true matches each name, address, or hybrid blocking key would recover.
 
 No giant Cartesian merge is created.
 
@@ -32,7 +32,7 @@ import sys
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from normalize import normalize_name
+from normalize import normalize_name, normalize_address, address_signal_tokens
 from scoring import deterministic_split
 
 
@@ -126,6 +126,64 @@ def make_name_features(series):
     }
 
 
+def make_address_features(series):
+    """
+    Compute country-agnostic address blocking signatures.
+
+    These are deliberately conservative:
+      - address_norm: normalized full address
+      - address_sorted_signal: sorted unique informative address tokens
+      - address_first3_signal: first 3 informative address tokens
+      - address_digits: digit sequences from the address
+      - address_boundary: first 4 + last 4 alphanumeric characters
+
+    The evaluator adds country to every blocking key during comparison.
+    Empty/low-information keys are returned as "" and therefore cannot
+    produce a blocking hit.
+    """
+    norm_series = series.astype(str).map(normalize_address)
+    values = norm_series.tolist()
+
+    address_norm = norm_series.tolist()
+    address_sorted_signal = []
+    address_first3_signal = []
+    address_digits = []
+    address_boundary = []
+
+    for raw, n in zip(values, values):
+        sig = sorted(set(address_signal_tokens(raw)))
+
+        if len(sig) >= 2:
+            address_sorted_signal.append(" ".join(sig))
+        else:
+            address_sorted_signal.append("")
+
+        if sig:
+            address_first3_signal.append(" ".join(sig[:3]))
+        else:
+            address_first3_signal.append("")
+
+        nums = re.findall(r"\d+", n)
+        if nums:
+            address_digits.append("|".join(nums))
+        else:
+            address_digits.append("")
+
+        compact = re.sub(r"[^a-z0-9]+", "", n)
+        if len(compact) >= 8:
+            address_boundary.append(compact[:4] + "|" + compact[-4:])
+        else:
+            address_boundary.append("")
+
+    return {
+        "address_norm": address_norm,
+        "address_sorted_signal": address_sorted_signal,
+        "address_first3_signal": address_first3_signal,
+        "address_digits": address_digits,
+        "address_boundary": address_boundary,
+    }
+
+
 def fetch_true_matches(source_path, needed_ids):
     """
     Read the large source file in chunks and retain only records whose
@@ -133,7 +191,7 @@ def fetch_true_matches(source_path, needed_ids):
     """
     if not needed_ids:
         return pd.DataFrame(
-            columns=["entity_id", "business_name", "country"]
+            columns=["entity_id", "business_name", "business_address", "country"]
         )
 
     print(
@@ -154,7 +212,7 @@ def fetch_true_matches(source_path, needed_ids):
         hit = chunk[chunk["entity_id"].isin(needed_ids)]
         if not hit.empty:
             pieces.append(
-                hit[["entity_id", "business_name", "country"]].copy()
+                hit[["entity_id", "business_name", "business_address", "country"]].copy()
             )
 
     if not pieces:
@@ -163,6 +221,13 @@ def fetch_true_matches(source_path, needed_ids):
         )
 
     out = pd.concat(pieces, ignore_index=True)
+
+    required_cols = {"entity_id", "business_name", "business_address", "country"}
+    missing = required_cols - set(out.columns)
+    if missing:
+        raise RuntimeError(
+            f"{os.path.basename(source_path)} is missing required columns after fetching true matches: {sorted(missing)}"
+        )
 
     # Defensive check: every fetched ID should be unique.
     if out["entity_id"].duplicated().any():
@@ -176,11 +241,32 @@ def fetch_true_matches(source_path, needed_ids):
 
 
 def prepare_match_info(df):
-    feats = make_name_features(df["business_name"])
+    name_feats = make_name_features(df["business_name"])
+    addr_feats = make_address_features(df["business_address"])
+
     out = df[["entity_id", "country"]].copy()
 
-    for k, v in feats.items():
+    for k, v in name_feats.items():
         out[k] = v
+
+    for k, v in addr_feats.items():
+        out[k] = v
+
+    # Composite keys intentionally require both a useful name signal and a
+    # useful address signal. This catches cases where either name or address
+    # alone is too noisy while remaining much cheaper than fuzzy search.
+    out["first_token_addr_digits"] = [
+        f"{n}||{a}" if n and a else ""
+        for n, a in zip(out["first_token"], out["address_digits"])
+    ]
+    out["first_token_addr_first3"] = [
+        f"{n}||{a}" if n and a else ""
+        for n, a in zip(out["first_token"], out["address_first3_signal"])
+    ]
+    out["first_token_addr_boundary"] = [
+        f"{n}||{a}" if n and a else ""
+        for n, a in zip(out["first_token"], out["address_boundary"])
+    ]
 
     return out
 
@@ -326,7 +412,7 @@ def build_match_rows(gt, s1_val_ids, source_prefix):
     return pd.DataFrame(rows)
 
 
-def run(data_root, val_frac, seed):
+def run(data_root, val_frac, seed, sample_frac=None, sample_s1=None):
     train_dir = os.path.join(data_root, "train")
 
     print("Loading S1 + ground truth...", flush=True)
@@ -339,16 +425,52 @@ def run(data_root, val_frac, seed):
         s1["entity_id"], val_frac=val_frac, seed=seed
     )
 
+    # Optional deterministic sample of the validation fold. This is the
+    # intended first-pass mode for a multi-million-row dataset: it preserves
+    # the exact same validation split semantics while reducing only the S1
+    # entities whose true-match rows are inspected.
+    if sample_frac is not None:
+        if not (0.0 < sample_frac <= 1.0):
+            raise ValueError("--sample-frac must be in (0, 1]")
+        # Hash-based sampling avoids bias from lexical ordering of entity IDs
+        # while staying perfectly reproducible across runs/processes.
+        import hashlib
+        sample_seed = seed + 100003
+        sample_threshold = int(sample_frac * (2 ** 32))
+        val_ids = {
+            eid for eid in val_ids
+            if int(hashlib.md5(f"{sample_seed}-{eid}".encode()).hexdigest()[:8], 16) < sample_threshold
+        }
+        if not val_ids:
+            raise RuntimeError("Sample produced zero validation entities; increase --sample-frac")
+        print(
+            f"sampled validation fold: {len(val_ids):,} entities "
+            f"({sample_frac:.1%} of validation fold)",
+            flush=True,
+        )
+    elif sample_s1 is not None:
+        if sample_s1 <= 0:
+            raise ValueError("--sample-s1 must be > 0")
+        import hashlib
+        ranked = sorted(
+            val_ids,
+            key=lambda eid: hashlib.md5(f"{seed + 100003}-{eid}".encode()).hexdigest(),
+        )
+        val_ids = set(ranked[:min(sample_s1, len(ranked))])
+        print(
+            f"sampled validation fold: {len(val_ids):,} entities "
+            f"(--sample-s1)",
+            flush=True,
+        )
+
     s1_val = s1[s1["entity_id"].isin(val_ids)].reset_index(drop=True)
 
     print(f"validation S1 entities: {len(s1_val):,}", flush=True)
-    print("Preparing S1 name signatures...", flush=True)
+    print("Preparing S1 name + address signatures...", flush=True)
 
-    s1_features = make_name_features(s1_val["business_name"])
-
-    s1_info = s1_val[["entity_id", "country"]].copy()
-    for k, v in s1_features.items():
-        s1_info[k] = v
+    # IMPORTANT: address-based keys are now part of the recall experiment,
+    # so S1 must be prepared with both name and address features as well.
+    s1_info = prepare_match_info(s1_val)
 
     s2_match_pairs = build_match_rows(gt, val_ids, "S2")
     s3_match_pairs = build_match_rows(gt, val_ids, "S3")
@@ -385,6 +507,14 @@ def run(data_root, val_frac, seed):
             "last_token",
             "first_last",
             "boundary",
+            "address_norm",
+            "address_sorted_signal",
+            "address_first3_signal",
+            "address_digits",
+            "address_boundary",
+            "first_token_addr_digits",
+            "first_token_addr_first3",
+            "first_token_addr_boundary",
         ]
         if pair_df.empty:
             return pd.DataFrame(columns=feature_cols)
@@ -404,8 +534,14 @@ def run(data_root, val_frac, seed):
         # entity_id is absent from the source file (data gap). Without this,
         # those rows produce "nan||nan" composite keys in evaluate_key/union
         # which silently inflate miss counts rather than failing loudly.
-        for col in ["name_norm", "sorted_name", "first_token",
-                    "last_token", "first_last", "boundary", "country"]:
+        for col in [
+            "name_norm", "sorted_name", "first_token", "last_token",
+            "first_last", "boundary",
+            "address_norm", "address_sorted_signal", "address_first3_signal",
+            "address_digits", "address_boundary",
+            "first_token_addr_digits", "first_token_addr_first3",
+            "first_token_addr_boundary", "country",
+        ]:
             if col in m.columns:
                 m[col] = m[col].fillna("")
 
@@ -422,12 +558,25 @@ def run(data_root, val_frac, seed):
     all_eval = pd.concat([s2_eval, s3_eval], ignore_index=True)
 
     keys = [
+        # Existing name-only keys
         "name_norm",
         "sorted_name",
         "first_token",
         "last_token",
         "first_last",
         "boundary",
+
+        # New address-only keys
+        "address_norm",
+        "address_sorted_signal",
+        "address_first3_signal",
+        "address_digits",
+        "address_boundary",
+
+        # Conservative hybrid keys
+        "first_token_addr_digits",
+        "first_token_addr_first3",
+        "first_token_addr_boundary",
     ]
 
     print("\n" + "=" * 78)
@@ -447,35 +596,44 @@ def run(data_root, val_frac, seed):
         )
 
     unions = [
-        ("exact + sorted", ["name_norm", "sorted_name"]),
-        (
-            "exact + sorted + first_last",
-            ["name_norm", "sorted_name", "first_last"],
-        ),
-        (
-            "exact + sorted + first_last + boundary",
-            ["name_norm", "sorted_name", "first_last", "boundary"],
-        ),
-        # Category 3: added first_token combinations. first_token is the
-        # strongest single key (76% recall, 95.6% entity coverage) and is
-        # now used by baseline_pipeline.py as block_key_first. Including it
-        # here shows the actual ceiling of the updated pipeline.
-        (
-            "first_token only",
-            ["first_token"],
-        ),
-        (
-            "exact + first_token",
-            ["name_norm", "first_token"],
-        ),
-        (
-            "exact + first_token + sorted + first_last",
-            ["name_norm", "first_token", "sorted_name", "first_last"],
-        ),
-        (
-            "all name keys",
-            keys,
-        ),
+        ("name: first_token only",
+         ["first_token"]),
+
+        ("name: all name keys",
+         ["name_norm", "sorted_name", "first_token",
+          "last_token", "first_last", "boundary"]),
+
+        ("address: digits only",
+         ["address_digits"]),
+
+        ("address: norm + digits",
+         ["address_norm", "address_digits"]),
+
+        ("hybrid: first_token + address_digits",
+         ["first_token", "first_token_addr_digits"]),
+
+        ("hybrid: first_token + address_first3",
+         ["first_token", "first_token_addr_first3"]),
+
+        ("name + address_digits",
+         ["name_norm", "sorted_name", "first_token",
+          "last_token", "first_last", "boundary",
+          "address_digits"]),
+
+        ("name + address_norm + digits",
+         ["name_norm", "sorted_name", "first_token",
+          "last_token", "first_last", "boundary",
+          "address_norm", "address_digits"]),
+
+        ("name + all address keys",
+         ["name_norm", "sorted_name", "first_token",
+          "last_token", "first_last", "boundary",
+          "address_norm", "address_sorted_signal",
+          "address_first3_signal", "address_digits",
+          "address_boundary"]),
+
+        ("all name + all address + hybrids",
+         keys),
     ]
 
     print("\n" + "=" * 78)
@@ -498,8 +656,9 @@ def run(data_root, val_frac, seed):
     print(
         "These numbers measure whether a TRUE match shares a blocking key "
         "with its S1 entity. They do not yet include generic-block caps or "
-        "candidate-pair counts. We will use the strongest recall/efficiency "
-        "combination in the next matcher."
+        "candidate-pair counts. Address keys are diagnostic at this stage; "
+        "before full blocking we must also measure the number of candidates "
+        "each selected key would generate."
     )
 
 
@@ -508,6 +667,23 @@ if __name__ == "__main__":
     parser.add_argument("--data-root", default="dataset")
     parser.add_argument("--val-frac", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sample-frac", type=float, default=None,
+        help="deterministically evaluate only this fraction of the validation fold, e.g. 0.10"
+    )
+    parser.add_argument(
+        "--sample-s1", type=int, default=None,
+        help="alternative deterministic cap on validation S1 entities"
+    )
     args = parser.parse_args()
 
-    run(args.data_root, args.val_frac, args.seed)
+    if args.sample_frac is not None and args.sample_s1 is not None:
+        parser.error("use only one of --sample-frac or --sample-s1")
+
+    run(
+        args.data_root,
+        args.val_frac,
+        args.seed,
+        sample_frac=args.sample_frac,
+        sample_s1=args.sample_s1,
+    )
