@@ -1,0 +1,5 @@
+key,candidate_pairs_sample,mean_candidates_per_s1,median_nonzero,p95_nonzero,max_candidates_per_s1
+first_two,23503508,532.7660712666607,12.0,956.0,18561
+first_two__addr_digits,55506,1.258182972164294,2.0,4.0,82
+first_two__addr_first3,33163,0.7517227309819566,1.0,3.0,9
+first_two__addr_norm,8605,0.19505394868075074,1.0,2.0,5
